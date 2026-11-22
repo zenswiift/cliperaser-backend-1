@@ -15,54 +15,63 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
 class VideoRequest(BaseModel):
     youtube_url: str
 
-def get_vid_id(url: str):
-    m = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
-    return m.group(1) if m else None
-
 @app.get("/")
 def home():
-    return {"status": "ClipEraser Engine Live", "mode": "Cobalt-Unblockable"}
+    return {"status": "ClipEraser Engine Live", "mode": "Gemini-Audio-Direct"}
+
+def get_cobalt_stream(youtube_url: str, audio_only: bool = False):
+    instances = ["https://cobalt.tools", "https://kwiatekmiki.com", "https://timelessnesses.me"]
+    payload = {"url": youtube_url, "videoQuality": "720"}
+    if audio_only:
+        payload["downloadMode"] = "audio"
+        payload["audioFormat"] = "mp3"
+    for api_url in instances:
+        try:
+            r = requests.post(api_url, headers={"Accept": "application/json", "Content-Type": "application/json"}, json=payload, timeout=20)
+            if r.status_code == 200 and r.json().get("url"):
+                return r.json().get("url")
+        except Exception:
+            continue
+    return None
 
 @app.post("/api/clip")
 async def create_clips(req: VideoRequest):
     try:
-        vid = get_vid_id(req.youtube_url)
-        if not vid:
-            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+        # 1. Cobalt se Audio aur Video stream lena (No YouTube Block!)
+        audio_url = get_cobalt_stream(req.youtube_url, audio_only=True)
+        video_url = get_cobalt_stream(req.youtube_url, audio_only=False)
+        if not video_url:
+            raise HTTPException(status_code=500, detail="Video stream fetch nahi ho paya, dubara try karein.")
 
-        # 1. Free Transcript via Tactiq/Public API (No YouTube IP Block)
-        t_res = requests.post("https://tactiq.io", json={"videoUrl": req.youtube_url, "langCode": "en"}, timeout=20)
-        if t_res.status_code != 200 or not t_res.json().get("captions"):
-            t_res = requests.post("https://tactiq.io", json={"videoUrl": req.youtube_url, "langCode": "hi"}, timeout=20)
-        
-        captions = t_res.json().get("captions", []) if t_res.status_code == 200 else []
-        if not captions:
-            raise HTTPException(status_code=400, detail="Is video ka transcript nahi mila (kisi aur video se try karein).")
+        # 2. Low-size Audio download (sirf 2-3MB) taaki Gemini khud sun kar viral clips chune
+        if os.path.exists("temp_audio.mp3"):
+            os.remove("temp_audio.mp3")
+        subprocess.run(["ffmpeg", "-y", "-i", audio_url or video_url, "-t", "1800", "-ar", "16000", "-ac", "1", "-b:a", "24k", "temp_audio.mp3"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        transcript = "\n".join([f"[{float(c['start']):.1f}s]: {c['text']}" for c in captions])
+        if not os.path.exists("temp_audio.mp3"):
+            raise HTTPException(status_code=500, detail="Audio extract nahi ho paya.")
 
-        # 2. Gemini AI se Top 5 Viral Clips
-        prompt = f"Pick top 5 viral 30-55s clips from this transcript. Return ONLY valid JSON array: [{{\"title\": \"Hook Title\", \"start\": 15.0, \"end\": 55.0, \"virality_score\": 96}}]\nTranscript:\n{transcript[:100000]}"
+        # 3. Gemini AI se direct Audio sunwa kar Top 5 Viral Moments nikalna
+        uploaded_audio = genai.upload_file("temp_audio.mp3")
+        prompt = "Listen to this audio carefully and pick the top 5 most viral, high-retention 30-to-55 second moments for YouTube Shorts/Reels. Return ONLY a valid JSON array with exact start and end seconds: [{\"title\": \"Catchy Viral Title\", \"start\": 15.0, \"end\": 55.0, \"virality_score\": 96}]"
+
         raw = ""
         for m in ["gemini-2.5-flash", "gemini-1.5-flash"]:
             try:
-                raw = genai.GenerativeModel(m).generate_content(prompt).text
+                raw = genai.GenerativeModel(m).generate_content([uploaded_audio, prompt]).text
                 break
             except Exception:
                 continue
 
+        if os.path.exists("temp_audio.mp3"):
+            os.remove("temp_audio.mp3")
+
         match = re.search(r"\[.*\]", raw, re.DOTALL)
         if not match:
-            raise HTTPException(status_code=500, detail="AI response error.")
+            raise HTTPException(status_code=500, detail="AI viral clips nahi chun paya, dubara try karein.")
         clips = json.loads(match.group(0))
 
-        # 3. Direct Stream URL via Cobalt API (Bypasses YouTube Bot Block 100%)
-        c_res = requests.post("https://cobalt.tools", headers={"Accept": "application/json", "Content-Type": "application/json"}, json={"url": req.youtube_url, "videoQuality": "720"}, timeout=25).json()
-        stream_url = c_res.get("url")
-        if not stream_url:
-            raise HTTPException(status_code=500, detail=f"Video stream fetch nahi ho paya: {c_res}")
-
-        # 4. FFmpeg se direct stream se 9:16 clips kaatna (Bina poora video download kiye!)
+        # 4. FFmpeg se direct video stream se 9:16 clips kaatna
         results = []
         for idx, c in enumerate(clips):
             st, et = float(c["start"]), float(c["end"])
@@ -71,7 +80,7 @@ async def create_clips(req: VideoRequest):
             if os.path.exists(out_file):
                 os.remove(out_file)
 
-            subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-i", stream_url, "-t", str(dur), "-vf", "crop=ih*(9/16):ih,scale=720:1280", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", out_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-i", video_url, "-t", str(dur), "-vf", "crop=ih*(9/16):ih,scale=720:1280", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", out_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             if os.path.exists(out_file):
                 results.append({"id": idx + 1, "title": c["title"], "virality_score": c.get("virality_score", 95), "duration": f"{int(dur)}s", "video_url": f"/clips/clip_{idx+1}.mp4"})
