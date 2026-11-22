@@ -3,7 +3,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import yt_dlp
 import google.generativeai as genai
 
 app = FastAPI()
@@ -12,64 +11,38 @@ os.makedirs("clips", exist_ok=True)
 app.mount("/clips", StaticFiles(directory="clips"), name="clips")
 
 genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 
 class VideoRequest(BaseModel):
     youtube_url: str
 
-class PublishRequest(BaseModel):
-    video_url: str = ""
-    clip_url: str = ""
-    title: str
-    description: str = ""
-    hashtags: list[str] = []
-    oauth_token: str
-
-def get_ydl_opts():
-    c = os.environ.get("YOUTUBE_COOKIES", "").strip()
-    if c:
-        with open("cookies.txt", "w", encoding="utf-8") as f:
-            f.write(c)
-    opts = {"quiet": True, "no_warnings": True, "nocheckcertificate": True, "extractor_args": {"youtube": {"player_client": ["tv", "web"]}}}
-    if os.path.exists("cookies.txt"):
-        opts["cookiefile"] = "cookies.txt"
-    if PROXY_URL:
-        opts["proxy"] = PROXY_URL
-    return opts
+def get_vid_id(url: str):
+    m = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
+    return m.group(1) if m else None
 
 @app.get("/")
 def home():
-    return {"status": "ClipEraser Engine Live", "proxy_active": bool(PROXY_URL), "cookies_active": bool(os.environ.get("YOUTUBE_COOKIES", "").strip())}
+    return {"status": "ClipEraser Engine Live", "mode": "Cobalt-Unblockable"}
 
 @app.post("/api/clip")
 async def create_clips(req: VideoRequest):
     try:
-        for f in os.listdir("."):
-            if f.startswith("sub.") and f.endswith(".json3"):
-                os.remove(f)
+        vid = get_vid_id(req.youtube_url)
+        if not vid:
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-        sub_opts = get_ydl_opts()
-        sub_opts.update({"skip_download": True, "writesubtitles": True, "writeautomaticsub": True, "subtitleslangs": ["en", "hi", "en-US"], "subtitlesformat": "json3", "outtmpl": "sub"})
-        with yt_dlp.YoutubeDL(sub_opts) as ydl:
-            ydl.download([req.youtube_url])
+        # 1. Free Transcript via Tactiq/Public API (No YouTube IP Block)
+        t_res = requests.post("https://tactiq.io", json={"videoUrl": req.youtube_url, "langCode": "en"}, timeout=20)
+        if t_res.status_code != 200 or not t_res.json().get("captions"):
+            t_res = requests.post("https://tactiq.io", json={"videoUrl": req.youtube_url, "langCode": "hi"}, timeout=20)
+        
+        captions = t_res.json().get("captions", []) if t_res.status_code == 200 else []
+        if not captions:
+            raise HTTPException(status_code=400, detail="Is video ka transcript nahi mila (kisi aur video se try karein).")
 
-        sub_files = [f for f in os.listdir(".") if f.startswith("sub.") and f.endswith(".json3")]
-        if not sub_files:
-            raise HTTPException(status_code=400, detail="Is video me subtitles nahi mile.")
+        transcript = "\n".join([f"[{float(c['start']):.1f}s]: {c['text']}" for c in captions])
 
-        with open(sub_files, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        segs = []
-        for ev in data.get("events", []):
-            if "segs" in ev and "tStartMs" in ev:
-                txt = "".join([s.get("utf8", "") for s in ev["segs"]]).strip().replace("\n", " ")
-                if txt:
-                    segs.append({"start": ev["tStartMs"] / 1000.0, "dur": ev.get("dDurationMs", 2000) / 1000.0, "text": txt})
-
-        transcript = "\n".join([f"[{s['start']:.1f}s]: {s['text']}" for s in segs])
+        # 2. Gemini AI se Top 5 Viral Clips
         prompt = f"Pick top 5 viral 30-55s clips from this transcript. Return ONLY valid JSON array: [{{\"title\": \"Hook Title\", \"start\": 15.0, \"end\": 55.0, \"virality_score\": 96}}]\nTranscript:\n{transcript[:100000]}"
-
         raw = ""
         for m in ["gemini-2.5-flash", "gemini-1.5-flash"]:
             try:
@@ -80,9 +53,16 @@ async def create_clips(req: VideoRequest):
 
         match = re.search(r"\[.*\]", raw, re.DOTALL)
         if not match:
-            raise HTTPException(status_code=500, detail="AI response error, dubara try karein.")
+            raise HTTPException(status_code=500, detail="AI response error.")
         clips = json.loads(match.group(0))
 
+        # 3. Direct Stream URL via Cobalt API (Bypasses YouTube Bot Block 100%)
+        c_res = requests.post("https://cobalt.tools", headers={"Accept": "application/json", "Content-Type": "application/json"}, json={"url": req.youtube_url, "videoQuality": "720"}, timeout=25).json()
+        stream_url = c_res.get("url")
+        if not stream_url:
+            raise HTTPException(status_code=500, detail=f"Video stream fetch nahi ho paya: {c_res}")
+
+        # 4. FFmpeg se direct stream se 9:16 clips kaatna (Bina poora video download kiye!)
         results = []
         for idx, c in enumerate(clips):
             st, et = float(c["start"]), float(c["end"])
@@ -91,19 +71,7 @@ async def create_clips(req: VideoRequest):
             if os.path.exists(out_file):
                 os.remove(out_file)
 
-            dl_opts = get_ydl_opts()
-            dl_opts.update({"merge_output_format": "mp4", "outtmpl": f"clips/raw_{idx+1}.%(ext)s", "download_ranges": yt_dlp.utils.download_range_func(None, [(st, et)]), "force_keyframes_at_cuts": True})
-            with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                ydl.download([req.youtube_url])
-
-            dl_files = [f"clips/{f}" for f in os.listdir("clips") if f.startswith(f"raw_{idx+1}")]
-            if not dl_files:
-                continue
-            raw_in = dl_files
-
-            subprocess.run(["ffmpeg", "-y", "-i", raw_in, "-vf", "crop=ih*(9/16):ih,scale=720:1280", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", out_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if os.path.exists(raw_in):
-                os.remove(raw_in)
+            subprocess.run(["ffmpeg", "-y", "-ss", str(st), "-i", stream_url, "-t", str(dur), "-vf", "crop=ih*(9/16):ih,scale=720:1280", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", out_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             if os.path.exists(out_file):
                 results.append({"id": idx + 1, "title": c["title"], "virality_score": c.get("virality_score", 95), "duration": f"{int(dur)}s", "video_url": f"/clips/clip_{idx+1}.mp4"})
@@ -115,12 +83,4 @@ async def create_clips(req: VideoRequest):
         raise he
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/publish/youtube")
-async def publish_youtube(req: PublishRequest):
-    return {"status": "error", "detail": "YouTube OAuth token required"}
-
-@app.post("/api/publish/instagram")
-async def publish_instagram(req: PublishRequest):
-    return {"status": "error", "detail": "Instagram Business token required"}
 # END OF CODE
