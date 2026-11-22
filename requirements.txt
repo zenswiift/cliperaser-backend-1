@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+yt-dlp[default]
+google-generativeai
+pydantic
+requests
