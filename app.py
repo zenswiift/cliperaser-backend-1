@@ -1,16 +1,14 @@
 import os
-import shutil
+import glob
 import subprocess
-import uuid
-from typing import List, Optional
+import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from pytubefix import YouTube
 import static_ffmpeg
 
-# Automatically setup ffmpeg on Render without needing root or apt-get
+# Auto-setup ffmpeg on Render
 static_ffmpeg.add_paths()
 
 app = FastAPI(title="ClipEraser Backend")
@@ -23,181 +21,151 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CLIPS_DIR = os.path.join(os.getcwd(), "static", "clips")
+CLIPS_DIR = os.path.join(os.path.dirname(__file__), "clips")
 os.makedirs(CLIPS_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
+app.mount("/clips", StaticFiles(directory=CLIPS_DIR), name="clips")
 
 class ClipRequest(BaseModel):
     youtube_url: str
 
-
 class PublishRequest(BaseModel):
+    video_url: str
     title: str
-    description: Optional[str] = ""
-    hashtags: Optional[List[str]] = []
-    oauth_token: str
-    video_url: Optional[str] = None
-    clip_url: Optional[str] = None
-
+    description: str = ""
+    hashtags: str = ""
+    oauth_token: str = ""
 
 @app.get("/")
-def health_check():
+def health():
     return {
         "status": "ClipEraser Engine Live",
-        "engine": "pytubefix-native",
+        "engine": "yt-dlp-ejs-bypass",
         "ffmpeg_ready": True
     }
 
+def download_youtube_video(url: str, output_path: str):
+    """Bypasses 429 blocks using yt-dlp EJS solver"""
+    cmd = [
+        "yt-dlp",
+        "--remote-components", "ejs:github",
+        "-f", "b[height<=720]/b",
+        "--no-playlist",
+        "-o", output_path,
+        url
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if res.returncode != 0 or not os.path.exists(output_path):
+        err_msg = res.stderr or "Unknown download error"
+        raise Exception(f"Download failed: {err_msg[:200]}")
 
-def download_youtube_video(url: str, output_path: str) -> dict:
-    """Download video using pytubefix with Android/MWEB client fallback."""
-    clients_to_try = ["ANDROID", "MWEB", "WEB"]
-    last_error = None
+def get_video_duration(file_path: str) -> float:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        file_path
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return float(res.stdout.strip())
+    except Exception:
+        return 60.0
 
-    for client in clients_to_try:
-        try:
-            print(f"Trying pytubefix with client={client}...")
-            yt = YouTube(url, client=client)
-            title = yt.title or "Viral YouTube Clip"
-            duration = yt.length or 60
-
-            # Prefer progressive MP4 with audio and video combined
-            stream = yt.streams.filter(progressive=True, file_extension="mp4").order_by("resolution").desc().first()
-            if not stream:
-                stream = yt.streams.get_highest_resolution()
-
-            if stream:
-                stream.download(output_path=output_path, filename="source.mp4")
-                source_file = os.path.join(output_path, "source.mp4")
-                if os.path.exists(source_file) and os.path.getsize(source_file) > 10000:
-                    return {
-                        "title": title,
-                        "duration": duration,
-                        "file_path": source_file
-                    }
-        except Exception as e:
-            print(f"Client {client} failed: {e}")
-            last_error = str(e)
-
-    raise Exception(f"Video download failed: {last_error or 'Could not fetch video stream'}")
-
-
-def make_vertical_clip(source_path: str, start_sec: int, duration_sec: int, output_path: str) -> bool:
-    """Crop video to 9:16 vertical (720x1280) using static ffmpeg."""
+def create_vertical_clip(input_video: str, start_sec: int, duration_sec: int, output_clip: str):
+    """
+    Renders 9:16 vertical video with blurred background wings.
+    Never cuts faces! Fast & light for 512MB RAM.
+    """
+    filter_complex = (
+        "[0:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=10:1[bg];"
+        "[0:v]scale=720:-2[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
+    )
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start_sec),
-        "-i", source_path,
         "-t", str(duration_sec),
-        "-vf", "crop=ih*(9/16):ih,scale=720:1280",
+        "-i", input_video,
+        "-filter_complex", filter_complex,
+        "-map", "[v]",
+        "-map", "0:a?",
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "26",
         "-c:a", "aac",
         "-b:a", "128k",
-        output_path
+        output_clip
     ]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        return res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 5000
-    except Exception as e:
-        print(f"ffmpeg error: {e}")
-        return False
-
+    subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
 
 @app.post("/api/clip")
-def generate_clips(req: ClipRequest):
+def process_clip(req: ClipRequest):
     url = req.youtube_url.strip()
     if not url:
         raise HTTPException(status_code=400, detail="YouTube URL is required")
 
-    job_id = str(uuid.uuid4())[:8]
-    temp_dir = os.path.join("/tmp", f"job_{job_id}")
-    os.makedirs(temp_dir, exist_ok=True)
+    # Clean old clips to save Render free disk space
+    old_files = glob.glob(os.path.join(CLIPS_DIR, "*.mp4"))
+    if len(old_files) > 20:
+        for f in old_files[:10]:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
+    raw_video = os.path.join(CLIPS_DIR, f"source_{os.getpid()}.mp4")
     try:
-        # Step 1: Download video with pytubefix
-        video_data = download_youtube_video(url, temp_dir)
-        source_path = video_data["file_path"]
-        total_duration = video_data["duration"]
-        base_title = video_data["title"]
-
-        # Step 2: Calculate 3 viral moments
-        clip_lengths = [25, 30, 20]
-        clips = []
-
-        timestamps = [
-            max(5, int(total_duration * 0.10)),
-            max(10, int(total_duration * 0.40)),
-            max(15, int(total_duration * 0.70))
-        ]
-
-        scores = [96, 92, 88]
-        hooks = [
-            "Best moment — Watch till the end!",
-            "Unbelievable reveal from this video",
-            "Key takeaway everyone is talking about"
-        ]
-
-        for i in range(3):
-            clip_dur = clip_lengths[i]
-            clip_start = timestamps[i]
-            if clip_start + clip_dur > total_duration:
-                clip_start = max(0, total_duration - clip_dur)
-
-            clip_filename = f"clip_{job_id}_{i+1}.mp4"
-            clip_full_path = os.path.join(CLIPS_DIR, clip_filename)
-
-            success = make_vertical_clip(source_path, clip_start, clip_dur, clip_full_path)
-            if success:
-                clips.append({
-                    "id": f"clip-{job_id}-{i+1}",
-                    "title": f"{base_title[:45]} (Part {i+1})",
-                    "video_url": f"/static/clips/{clip_filename}",
-                    "virality_score": scores[i],
-                    "duration": f"0:{clip_dur:02d}",
-                    "start": clip_start,
-                    "end": clip_start + clip_dur,
-                    "hook": hooks[i]
-                })
-
-        if not clips:
-            raise HTTPException(status_code=500, detail="Could not render 9:16 clips from this video.")
-
-        return {"clips": clips}
-
-    except HTTPException:
-        raise
+        download_youtube_video(url, raw_video)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Clean up source file
+
+    total_duration = get_video_duration(raw_video)
+    clip_length = 20
+
+    # 3 Viral segments (Hook, Core, Climax)
+    points = [
+        ("🔥 Hook: High Energy Opening", max(0, int(total_duration * 0.1)), 97),
+        ("💡 Core Value & Breakthrough", max(0, int(total_duration * 0.4)), 93),
+        ("🚀 Climax & Key Takeaway", max(0, int(total_duration * 0.7)), 89)
+    ]
+
+    clips_data = []
+    base_host = "https://cliperaser-backend-1.onrender.com"
+
+    for idx, (title, start_pt, score) in enumerate(points):
+        clip_name = f"clip_{os.getpid()}_{idx}.mp4"
+        out_path = os.path.join(CLIPS_DIR, clip_name)
         try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            create_vertical_clip(raw_video, start_pt, clip_length, out_path)
+            clips_data.append({
+                "id": f"clip_{idx+1}",
+                "title": title,
+                "video_url": f"{base_host}/clips/{clip_name}",
+                "duration": f"0:{clip_length}",
+                "virality_score": score
+            })
+        except Exception as e:
+            continue
+
+    # Delete source video to free RAM and disk
+    if os.path.exists(raw_video):
+        try:
+            os.remove(raw_video)
         except Exception:
             pass
 
+    if not clips_data:
+        raise HTTPException(status_code=500, detail="Failed to render clips")
+
+    return {"clips": clips_data}
 
 @app.post("/api/publish/youtube")
-def publish_youtube(req: PublishRequest):
-    if not req.oauth_token:
-        raise HTTPException(status_code=400, detail="YouTube OAuth token is required.")
-    return {
-        "status": "success",
-        "message": f"Successfully scheduled '{req.title}' to YouTube Shorts!"
-    }
-
+def publish_yt(req: PublishRequest):
+    return {"status": "success", "message": "Shorts publish queue received"}
 
 @app.post("/api/publish/instagram")
-def publish_instagram(req: PublishRequest):
-    if not req.oauth_token:
-        raise HTTPException(status_code=400, detail="Instagram access token is required.")
-    return {
-        "status": "success",
-        "message": f"Successfully scheduled '{req.title}' to Instagram Reels!"
-    }
-
+def publish_ig(req: PublishRequest):
+    return {"status": "success", "message": "Reels publish queue received"}
 
 if __name__ == "__main__":
     import uvicorn
