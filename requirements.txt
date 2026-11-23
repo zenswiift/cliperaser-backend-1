@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-pytubefix
-static-ffmpeg
 pydantic
+yt-dlp>=2025.01.01
+yt-dlp-ejs
+static-ffmpeg
